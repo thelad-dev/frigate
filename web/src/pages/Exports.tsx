@@ -22,6 +22,12 @@ import {
   DialogFooter,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import Heading from "@/components/ui/heading";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -779,24 +785,40 @@ function Exports() {
                 />
                 <div className="flex items-center gap-1 md:gap-2">
                   {(exportsByCase[selectedCase.id]?.length ?? 0) > 0 && (
-                    <Button
-                      asChild
-                      className="flex items-center gap-2 p-2"
-                      size="sm"
-                      aria-label={t("button.download", { ns: "common" })}
-                    >
-                      <a
-                        download
-                        href={`${baseUrl}api/cases/${selectedCase.id}/download`}
-                      >
-                        <LuDownload className="text-secondary-foreground" />
-                        {!isMobile && (
-                          <div className="text-primary">
-                            {t("button.download", { ns: "common" })}
-                          </div>
-                        )}
-                      </a>
-                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          className="flex items-center gap-2 p-2"
+                          size="sm"
+                          aria-label={t("button.download", { ns: "common" })}
+                        >
+                          <LuDownload className="text-secondary-foreground" />
+                          {!isMobile && (
+                            <div className="text-primary">
+                              {t("button.download", { ns: "common" })}
+                            </div>
+                          )}
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem className="cursor-pointer" asChild>
+                          <a
+                            download
+                            href={`${baseUrl}api/cases/${selectedCase.id}/download`}
+                          >
+                            {t("toolbar.download.zip")}
+                          </a>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem className="cursor-pointer" asChild>
+                          <a
+                            download
+                            href={`${baseUrl}api/cases/${selectedCase.id}/download?format=mp4`}
+                          >
+                            {t("toolbar.download.video")}
+                          </a>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   )}
                   {isAdmin && (
                     <>

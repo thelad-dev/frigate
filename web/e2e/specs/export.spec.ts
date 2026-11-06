@@ -189,6 +189,32 @@ test.describe("Export Page - Case Detail @high", () => {
     ).toBeVisible();
   });
 
+  test("download offers the case as a zip or as a single video", async ({
+    frigateApp,
+  }) => {
+    await frigateApp.goto("/export");
+
+    await frigateApp.page
+      .getByText("Package Theft Investigation")
+      .first()
+      .click();
+    await frigateApp.page.getByRole("button", { name: "Download" }).click();
+
+    const zip = frigateApp.page.getByRole("menuitem", {
+      name: "Separate files (.zip)",
+    });
+    const video = frigateApp.page.getByRole("menuitem", {
+      name: "Single video (.mp4)",
+    });
+    await expect(zip).toBeVisible();
+    await expect(video).toBeVisible();
+    await expect(zip).toHaveAttribute("href", /\/api\/cases\/[^/]+\/download$/);
+    await expect(video).toHaveAttribute(
+      "href",
+      /\/api\/cases\/[^/]+\/download\?format=mp4$/,
+    );
+  });
+
   test("edit case opens a prefilled dialog", async ({ frigateApp }) => {
     await frigateApp.goto("/export");
 

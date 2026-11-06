@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import subprocess as sp
 import tempfile
 import zipfile
 from unittest.mock import patch
@@ -1695,3 +1697,303 @@ class TestHttpExport(BaseTestHttp):
             == 'attachment; filename="Burglary 2026-08.zip"; '
             "filename*=UTF-8''Burglary%202026-08.zip"
         )
+
+    def _create_video_case(
+        self, tmpdir: str, exports: list[tuple[str, str, str, float]]
+    ) -> ExportCase:
+        """Create a case holding one export per (id, camera, name, date)."""
+        case = ExportCase.create(
+            id="case_video",
+            name="Front door incident",
+            description="",
+            created_at=10,
+            updated_at=10,
+        )
+
+        for export_id, camera, name, date in exports:
+            video_path = os.path.join(tmpdir, f"{export_id}.mp4")
+            with open(video_path, "wb") as handle:
+                handle.write(b"video")
+
+            Export.create(
+                id=export_id,
+                camera=camera,
+                name=name,
+                date=date,
+                video_path=video_path,
+                thumb_path=os.path.join(tmpdir, f"{export_id}.webp"),
+                in_progress=False,
+                export_case=case,
+            )
+
+        return case
+
+    @staticmethod
+    def _fake_probe(signatures: dict[str, tuple] | None = None):
+        """Stand in for ffprobe: 2.5s per export, one shared format by default."""
+        from frigate.api.export import _CaseVideoSource
+
+        def probe(_ffprobe_path: str, export: Export) -> _CaseVideoSource:
+            signature = (signatures or {}).get(export.id, (("h264", 1920, 1080), ()))
+            return _CaseVideoSource(export=export, duration=2.5, signature=signature)
+
+        return probe
+
+    def test_download_export_case_as_video_joins_exports_in_start_order(self):
+        captured: dict[str, object] = {}
+
+        def fake_stream(ffmpeg_cmd: list[str], playlist_path: str):
+            chapters_path = ffmpeg_cmd[ffmpeg_cmd.index("ffmetadata") + 2]
+            captured["cmd"] = ffmpeg_cmd
+            captured["work_dir"] = os.path.dirname(playlist_path)
+            with open(playlist_path) as playlist:
+                captured["playlist"] = playlist.read()
+            with open(chapters_path) as chapters:
+                captured["chapters"] = chapters.read()
+            yield b"joined video"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            case = self._create_video_case(
+                tmpdir,
+                [
+                    ("export_late", "front_door", "Late; side=door", 200),
+                    ("export_early", "front_door", "Early", 100),
+                ],
+            )
+
+            with (
+                patch("frigate.api.export.CACHE_DIR", tmpdir),
+                patch(
+                    "frigate.api.export._probe_case_video_source",
+                    side_effect=self._fake_probe(),
+                ),
+                patch("frigate.api.export._run_clip_download", fake_stream),
+            ):
+                with AuthTestClient(self.app) as client:
+                    response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+            assert response.status_code == 200
+            assert response.content == b"joined video"
+            assert response.headers["content-type"] == "video/mp4"
+            assert response.headers["content-disposition"] == (
+                'attachment; filename="Front door incident.mp4"; '
+                "filename*=UTF-8''Front%20door%20incident.mp4"
+            )
+
+            assert captured["playlist"] == (
+                f"file '{os.path.join(tmpdir, 'export_early.mp4')}'\n"
+                f"file '{os.path.join(tmpdir, 'export_late.mp4')}'\n"
+            )
+            # one chapter per export, back to back in output time
+            assert captured["chapters"] == (
+                ";FFMETADATA1\n"
+                "[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2500\ntitle=Early\n"
+                "[CHAPTER]\nTIMEBASE=1/1000\nSTART=2500\nEND=5000\n"
+                "title=Late\\; side\\=door\n"
+            )
+
+            cmd = captured["cmd"]
+            assert cmd[cmd.index("-c") + 1] == "copy"
+            assert ["-map", "0:v:0", "-map", "0:a:0?"] == cmd[
+                cmd.index("-map") : cmd.index("-map") + 4
+            ]
+            assert cmd[cmd.index("-map_metadata") + 1] == "1"
+            assert cmd[cmd.index("-map_chapters") + 1] == "1"
+            assert not os.path.exists(captured["work_dir"])
+
+    def test_download_export_case_as_video_rejects_mixed_formats(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            case = self._create_video_case(
+                tmpdir,
+                [
+                    ("export_front", "front_door", "Front", 100),
+                    ("export_back", "backyard", "Back", 200),
+                ],
+            )
+
+            with (
+                patch("frigate.api.export.CACHE_DIR", tmpdir),
+                patch(
+                    "frigate.api.export._probe_case_video_source",
+                    side_effect=self._fake_probe(
+                        {"export_back": (("h264", 640, 480), ())}
+                    ),
+                ),
+                patch("frigate.api.export._run_clip_download") as stream,
+            ):
+                with AuthTestClient(self.app) as client:
+                    response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+            assert response.status_code == 400
+            assert "zip" in response.json()["message"]
+            stream.assert_not_called()
+            assert not [p for p in os.listdir(tmpdir) if p.startswith("case_video_")]
+
+    def test_download_export_case_as_video_joins_matching_cameras(self):
+        """Cameras with the same format are joined, ordered by start then camera."""
+        playlists: list[str] = []
+
+        def fake_stream(_ffmpeg_cmd: list[str], playlist_path: str):
+            with open(playlist_path) as playlist:
+                playlists.append(playlist.read())
+            yield b"video"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            case = self._create_video_case(
+                tmpdir,
+                [
+                    ("export_front", "front_door", "Front", 100),
+                    ("export_back", "backyard", "Back", 100),
+                ],
+            )
+
+            with (
+                patch("frigate.api.export.CACHE_DIR", tmpdir),
+                patch(
+                    "frigate.api.export._probe_case_video_source",
+                    side_effect=self._fake_probe(),
+                ),
+                patch("frigate.api.export._run_clip_download", fake_stream),
+            ):
+                with AuthTestClient(self.app) as client:
+                    response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+            assert response.status_code == 200
+            assert playlists == [
+                f"file '{os.path.join(tmpdir, 'export_back.mp4')}'\n"
+                f"file '{os.path.join(tmpdir, 'export_front.mp4')}'\n"
+            ]
+
+    def test_download_export_case_as_video_fails_on_unreadable_export(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            case = self._create_video_case(
+                tmpdir, [("export_broken", "front_door", "Broken", 100)]
+            )
+
+            with (
+                patch("frigate.api.export._probe_case_video_source", return_value=None),
+                patch("frigate.api.export._run_clip_download") as stream,
+            ):
+                with AuthTestClient(self.app) as client:
+                    response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+        assert response.status_code == 500
+        stream.assert_not_called()
+
+    def test_download_export_case_as_video_only_includes_allowed_cameras(self):
+        from fastapi import Request
+
+        from frigate.api.auth import get_allowed_cameras_for_filter
+
+        async def restricted(request: Request):
+            return ["front_door"]
+
+        self.app.dependency_overrides[get_allowed_cameras_for_filter] = restricted
+        playlists: list[str] = []
+
+        def fake_stream(_ffmpeg_cmd: list[str], playlist_path: str):
+            with open(playlist_path) as playlist:
+                playlists.append(playlist.read())
+            yield b"video"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            case = self._create_video_case(
+                tmpdir,
+                [
+                    ("export_front", "front_door", "Front", 100),
+                    ("export_back", "backyard", "Back", 200),
+                ],
+            )
+
+            with (
+                patch("frigate.api.export.CACHE_DIR", tmpdir),
+                patch(
+                    "frigate.api.export._probe_case_video_source",
+                    side_effect=self._fake_probe(),
+                ),
+                patch("frigate.api.export._run_clip_download", fake_stream),
+            ):
+                with AuthTestClient(self.app) as client:
+                    response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+            assert response.status_code == 200
+            assert playlists == [f"file '{os.path.join(tmpdir, 'export_front.mp4')}'\n"]
+
+    def test_download_export_case_as_video_without_files_is_not_found(self):
+        case = ExportCase.create(
+            id="case_missing",
+            name="Missing",
+            description="",
+            created_at=10,
+            updated_at=10,
+        )
+        Export.create(
+            id="export_missing",
+            camera="front_door",
+            name="Missing",
+            date=100,
+            video_path="/nonexistent/export_missing.mp4",
+            thumb_path="/nonexistent/export_missing.webp",
+            in_progress=False,
+            export_case=case,
+        )
+
+        with patch("frigate.api.export._probe_case_video_source") as probe:
+            with AuthTestClient(self.app) as client:
+                response = client.get(f"/cases/{case.id}/download?format=mp4")
+
+        assert response.status_code == 404
+        probe.assert_not_called()
+
+    def test_download_export_case_rejects_unknown_format(self):
+        with AuthTestClient(self.app) as client:
+            response = client.get("/cases/any/download?format=avi")
+
+        assert response.status_code == 422
+
+    def test_probe_case_video_source_signature(self):
+        from frigate.api.export import _probe_case_video_source
+
+        def ffprobe_output(extradata: str) -> str:
+            return json.dumps(
+                {
+                    "streams": [
+                        {
+                            "index": 0,
+                            "codec_type": "video",
+                            "codec_name": "h264",
+                            "profile": "High",
+                            "width": 2560,
+                            "height": 1440,
+                            "pix_fmt": "yuv420p",
+                            "extradata_hash": extradata,
+                        },
+                        {"index": 1, "codec_type": "data"},
+                    ],
+                    "format": {"duration": "65.978000"},
+                }
+            )
+
+        export = Export(id="export_probe", video_path="/media/export.mp4")
+
+        def probe(stdout: str, returncode: int = 0):
+            completed = sp.CompletedProcess([], returncode, stdout.encode(), b"")
+            with patch("frigate.api.export.sp.run", return_value=completed) as run:
+                source = _probe_case_video_source("ffprobe", export)
+            return source, run
+
+        first, run = probe(ffprobe_output("SHA256:aaaa"))
+        same, _ = probe(ffprobe_output("SHA256:aaaa"))
+        other_sps, _ = probe(ffprobe_output("SHA256:bbbb"))
+
+        assert run.call_args.args[0][-1] == "/media/export.mp4"
+        assert first is not None
+        assert first.duration == 65.978
+        assert first.signature == same.signature
+        assert first.signature != other_sps.signature
+
+        failed, _ = probe("", returncode=1)
+        assert failed is None
+
+        no_video, _ = probe(json.dumps({"streams": [], "format": {"duration": "1"}}))
+        assert no_video is None

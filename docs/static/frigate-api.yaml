@@ -3760,11 +3760,11 @@ paths:
     get:
       tags:
         - Export
-      summary: Download export case as zip
+      summary: Download export case
       description: |-
         **Access:** Any authenticated user.
 
-        Streams a zip archive containing every completed export's mp4 for the given case.
+        Downloads every completed export of the given case. With format=zip (the default) the exports' mp4 files are streamed as a zip archive. With format=mp4 the exports are joined, in order of their start time, into a single mp4 without re-encoding. Each export becomes a chapter, and the time between exports is not included. Joining requires every export to share the same video format, otherwise a 400 is returned.
       operationId: download_export_case_cases__case_id__download_get
       parameters:
         - name: case_id
@@ -3773,6 +3773,12 @@ paths:
           schema:
             type: string
             title: Case Id
+        - name: format
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/CaseDownloadFormatEnum'
+            default: zip
       responses:
         '200':
           description: Successful Response
@@ -8079,6 +8085,12 @@ components:
       required:
         - value
       title: CameraSetBody
+    CaseDownloadFormatEnum:
+      type: string
+      enum:
+        - zip
+        - mp4
+      title: CaseDownloadFormatEnum
     ChaptersEnum:
       type: string
       enum:
