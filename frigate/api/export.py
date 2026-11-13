@@ -2,14 +2,20 @@
 
 import contextlib
 import datetime
+import json
 import logging
 import os
 import random
+import shutil
 import string
+import subprocess as sp
+import tempfile
 import time
 import zipfile
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -59,8 +65,9 @@ from frigate.api.defs.response.export_response import (
 )
 from frigate.api.defs.response.generic_response import GenericResponse
 from frigate.api.defs.tags import Tags
+from frigate.api.media import _run_clip_download
 from frigate.api.media_auth import deny_response_for_media_uri
-from frigate.const import CLIPS_DIR, EXPORT_DIR
+from frigate.const import CACHE_DIR, CLIPS_DIR, EXPORT_DIR
 from frigate.jobs.export import (
     ExportJob,
     ExportQueueFullError,
@@ -518,15 +525,288 @@ def _content_disposition(filename: str, ascii_fallback: str) -> str:
     )
 
 
+class CaseDownloadFormatEnum(str, Enum):
+    zip = "zip"
+    mp4 = "mp4"
+
+
+# ffprobe only reads the container header, so this is generous
+_CASE_VIDEO_PROBE_TIMEOUT = 30
+
+
+@dataclass(frozen=True)
+class _CaseVideoSource:
+    export: Export
+    duration: float
+    signature: tuple[object, ...]
+
+
+def _stream_signature(stream: dict | None, fields: tuple[str, ...]) -> tuple:
+    if stream is None:
+        return ()
+
+    return tuple(stream.get(field) for field in fields)
+
+
+def _probe_case_video_source(
+    ffprobe_path: str, export: Export
+) -> _CaseVideoSource | None:
+    """Read the duration and stream layout of an export's video file.
+
+    The signature holds everything a stream copy join needs to match across
+    files. It includes the decoder config (extradata), because an H.264 file
+    whose SPS/PPS differ from the first file's decodes as garbage once joined,
+    even at the same codec and resolution.
+    """
+    try:
+        result = sp.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-show_data_hash",
+                "sha256",
+                "-show_entries",
+                "stream=index,codec_type,codec_name,profile,width,height,pix_fmt,"
+                "sample_rate,channels,extradata_hash:format=duration",
+                "-of",
+                "json",
+                export.video_path,
+            ],
+            capture_output=True,
+            timeout=_CASE_VIDEO_PROBE_TIMEOUT,
+        )
+    except (OSError, sp.TimeoutExpired):
+        logger.warning("Unable to probe export %s", export.id)
+        return None
+
+    if result.returncode != 0:
+        logger.warning("Unable to probe export %s", export.id)
+        return None
+
+    try:
+        probe = json.loads(result.stdout)
+        duration = float(probe["format"]["duration"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.warning("Unable to read the duration of export %s", export.id)
+        return None
+
+    streams = probe.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if video is None or duration <= 0:
+        return None
+
+    return _CaseVideoSource(
+        export=export,
+        duration=duration,
+        signature=(
+            _stream_signature(
+                video,
+                (
+                    "index",
+                    "codec_name",
+                    "profile",
+                    "width",
+                    "height",
+                    "pix_fmt",
+                    "extradata_hash",
+                ),
+            ),
+            _stream_signature(
+                audio,
+                (
+                    "index",
+                    "codec_name",
+                    "profile",
+                    "sample_rate",
+                    "channels",
+                    "extradata_hash",
+                ),
+            ),
+        ),
+    )
+
+
+def _escape_ffmetadata(value: str) -> str:
+    """Escape a value for an ffmetadata file, keeping it on a single line."""
+    value = " ".join(value.splitlines())
+
+    for char in ("\\", "=", ";", "#"):
+        value = value.replace(char, f"\\{char}")
+
+    return value
+
+
+def _write_case_video_inputs(
+    sources: list[_CaseVideoSource], work_dir: str
+) -> tuple[str, str]:
+    """Write the concat playlist and the chapter list for a case video.
+
+    Each export becomes one chapter titled with its name. Chapter offsets are
+    in output time: the exports play back to back, so the time between two
+    exports is not part of the video.
+    """
+    playlist_path = os.path.join(work_dir, "playlist.txt")
+    chapters_path = os.path.join(work_dir, "chapters.txt")
+
+    with open(playlist_path, "w", encoding="utf-8") as playlist:
+        for source in sources:
+            # concat playlists quote paths in single quotes, so a quote in an
+            # export's file name has to close, escape, and reopen the string
+            quoted = source.export.video_path.replace("'", "'\\''")
+            playlist.write(f"file '{quoted}'\n")
+
+    offset_ms = 0
+    with open(chapters_path, "w", encoding="utf-8") as chapters:
+        chapters.write(";FFMETADATA1\n")
+
+        for source in sources:
+            end_ms = offset_ms + int(round(source.duration * 1000))
+            chapters.write(
+                "[CHAPTER]\n"
+                "TIMEBASE=1/1000\n"
+                f"START={offset_ms}\n"
+                f"END={end_ms}\n"
+                f"title={_escape_ffmetadata(source.export.name)}\n"
+            )
+            offset_ms = end_ms
+
+    return playlist_path, chapters_path
+
+
+def _stream_case_video(
+    ffmpeg_cmd: list[str], playlist_path: str, work_dir: str
+) -> Iterator[bytes]:
+    """Stream the joined case video, removing its input files afterwards."""
+    try:
+        yield from _run_clip_download(ffmpeg_cmd, playlist_path)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _case_video_response(
+    request: Request, exports: list[Export], filename: str, ascii_fallback: str
+) -> JSONResponse | StreamingResponse:
+    """Join a case's exports into a single mp4 without re-encoding.
+
+    The exports are stream copied in order, which only works when they all
+    share the same codec parameters. Exports that don't (typically ones from
+    cameras with different resolutions or codecs) are rejected rather than
+    re-encoded, since re-encoding a whole case would be far too expensive.
+    """
+    ffmpeg_config = request.app.frigate_config.ffmpeg
+    sources: list[_CaseVideoSource] = []
+
+    for export in exports:
+        if not os.path.exists(export.video_path):
+            continue
+
+        source = _probe_case_video_source(ffmpeg_config.ffprobe_path, export)
+
+        if source is None:
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "message": "Unable to read one or more exports in this case.",
+                },
+                status_code=500,
+            )
+
+        sources.append(source)
+
+    if not sources:
+        return JSONResponse(
+            content={"success": False, "message": "No exports available to download."},
+            status_code=404,
+        )
+
+    if any(source.signature != sources[0].signature for source in sources[1:]):
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": "The exports in this case use different video formats "
+                "and can't be joined into a single video. Download the case as a "
+                "zip instead.",
+            },
+            status_code=400,
+        )
+
+    work_dir = tempfile.mkdtemp(prefix="case_video_", dir=CACHE_DIR)
+
+    try:
+        playlist_path, chapters_path = _write_case_video_inputs(sources, work_dir)
+    except OSError:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        logger.exception("Failed to prepare the case video")
+        return JSONResponse(
+            content={"success": False, "message": "Failed to prepare the video."},
+            status_code=500,
+        )
+
+    ffmpeg_cmd = [
+        ffmpeg_config.ffmpeg_path,
+        "-hide_banner",
+        "-y",
+        "-protocol_whitelist",
+        "pipe,file",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        playlist_path,
+        "-f",
+        "ffmetadata",
+        "-i",
+        chapters_path,
+        # only video and audio: exports can carry a chapter data track, and
+        # each export's own chapters would not line up in the joined video
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        # -map_metadata -1 would also drop the chapter titles
+        "-map_metadata",
+        "1",
+        "-map_chapters",
+        "1",
+        "-c",
+        "copy",
+        "-movflags",
+        "frag_keyframe+empty_moov",
+        "-f",
+        "mp4",
+        "pipe:",
+    ]
+
+    return StreamingResponse(
+        _stream_case_video(ffmpeg_cmd, playlist_path, work_dir),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": _content_disposition(filename, ascii_fallback),
+        },
+    )
+
+
 @router.get(
     "/cases/{case_id}/download",
     dependencies=[Depends(allow_any_authenticated())],
-    summary="Download export case as zip",
-    description="Streams a zip archive containing every completed export's mp4 for the given case.",
+    summary="Download export case",
+    description=(
+        "Downloads every completed export of the given case. With format=zip (the "
+        "default) the exports' mp4 files are streamed as a zip archive. With "
+        "format=mp4 the exports are joined, in order of their start time, into a "
+        "single mp4 without re-encoding. Each export becomes a chapter, and the time "
+        "between exports is not included. Joining requires every export to share the "
+        "same video format, otherwise a 400 is returned."
+    ),
 )
 def download_export_case(
     request: Request,
     case_id: str,
+    format: CaseDownloadFormatEnum = CaseDownloadFormatEnum.zip,
     allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     try:
@@ -544,7 +824,7 @@ def download_export_case(
             ~Export.in_progress,
             Export.camera << allowed_cameras,
         )
-        .order_by(Export.date.asc())
+        .order_by(Export.date.asc(), Export.camera.asc(), Export.id.asc())
     )
 
     if not exports:
@@ -556,6 +836,11 @@ def download_export_case(
     archive_base = sanitize_filename(case.name) if case.name else ""
     if not archive_base:
         archive_base = case_id
+
+    if format == CaseDownloadFormatEnum.mp4:
+        return _case_video_response(
+            request, exports, f"{archive_base}.mp4", f"{case_id}.mp4"
+        )
 
     return StreamingResponse(
         _stream_case_archive(exports, request.app.frigate_config.ui.timezone),

@@ -27,7 +27,11 @@
     "newCase": "New Case",
     "addExport": "Add Export",
     "editCase": "Edit Case",
-    "deleteCase": "Delete Case"
+    "deleteCase": "Delete Case",
+    "download": {
+      "zip": "Separate files (.zip)",
+      "video": "Single video (.mp4)"
+    }
   },
   "toast": {
     "error": {

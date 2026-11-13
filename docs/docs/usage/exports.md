@@ -34,10 +34,17 @@ All of your exports live on the **Exports** page, reachable from the main naviga
 - **Rename** it, and
 - **Delete** it: deleting is the only way an export is removed.
 
-You can also select multiple exports at once to **delete** them in bulk, or to **add them to** (or **remove them from**) a [case](#cases). To download multiple exports as a zip archive, add them to a **case** and use the Download button there.
+You can also select multiple exports at once to **delete** them in bulk, or to **add them to** (or **remove them from**) a [case](#cases). To download multiple exports at once, as a zip archive or joined into a single video, add them to a **case** and use the Download button there.
 
 ## Cases
 
-A **case** groups related exports together: for example, all the clips from a single incident across multiple cameras. On the **Exports** page you can create a case with a name and description, add existing exports to it (or create a new case while exporting), and **download the entire case as a single archive** to hand off as one package.
+A **case** groups related exports together: for example, all the clips from a single incident across multiple cameras. On the **Exports** page you can create a case with a name and description, add existing exports to it (or create a new case while exporting), and download the entire case to hand off as one package.
+
+The **Download** button of a case offers two formats:
+
+- **Separate files (.zip)**: a zip archive with each export as its own video file.
+- **Single video (.mp4)**: all exports of the case joined into one video without re-encoding, played back to back in order of their start time. Each export becomes a chapter named after the export, so you can jump between them in players that support chapters. The time between two exports is not part of the video: playback jumps from the end of one export to the start of the next. Exports that overlap in time, such as the same moment from several cameras, are played one after another.
+
+A single video is only possible when every export in the case has the same video and audio format (codec, resolution, and encoder settings). Exports from one camera normally match, exports from different cameras often don't. Frigate doesn't re-encode them, so download such a case as a zip archive instead.
 
 Exports that don't belong to a case appear under **Uncategorized Exports**. Deleting a case lets you either keep its exports (they move back to uncategorized) or delete them along with the case.
